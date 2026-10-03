@@ -1,0 +1,21 @@
+{
+  "name": "htap-benchmark",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "benchmark": "tsx src/benchmark.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@clickhouse/client": "^1.17.0",
+    "dotenv": "^17.2.3",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

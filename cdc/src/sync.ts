@@ -1,161 +1,311 @@
-import "dotenv/config";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import dotenv from "dotenv";
 import pg from "pg";
 import { createClient } from "@clickhouse/client";
 
 const { Pool } = pg;
 
-type SourceRow = {
-  order_id: string;
-  user_id: string;
-  product_id: string;
-  quantity: number;
-  unit_price: string;
-  total_amount: string;
-  status: string;
-  category: string;
-  order_created_at: string;
-};
+// ============================================================
+// Load project-root .env
+//
+// cdc/src/sync.ts
+//       ↑
+//       └── ../../.env
+// ============================================================
 
-const pgPool = new Pool({
-  connectionString:
-    process.env.DATABASE_URL ??
-    "postgresql://htap:change_me@localhost:5432/htap",
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({
+  path: path.resolve(__dirname, "../../.env"),
 });
+
+// ============================================================
+// Configuration
+// ============================================================
+
+const databaseUrl = process.env.DATABASE_URL;
+
+if (!databaseUrl) {
+  throw new Error(
+    "DATABASE_URL is missing. Configure it in the project-root .env file.",
+  );
+}
+
+const clickhouseUrl =
+  process.env.CLICKHOUSE_URL ?? "http://localhost:8123";
+
+const clickhouseDb =
+  process.env.CLICKHOUSE_DB ?? "htap_analytics";
+
+const clickhouseUser =
+  process.env.CLICKHOUSE_USER ?? "default";
+
+const clickhousePassword =
+  process.env.CLICKHOUSE_PASSWORD ?? "";
+
+// ============================================================
+// PostgreSQL
+// ============================================================
+
+const pool = new Pool({
+  connectionString: databaseUrl,
+});
+
+// ============================================================
+// ClickHouse
+// ============================================================
 
 const clickhouse = createClient({
-  url: process.env.CLICKHOUSE_URL ?? "http://localhost:8123",
-  username: process.env.CLICKHOUSE_USER ?? "default",
-  password: process.env.CLICKHOUSE_PASSWORD ?? "",
-  database: process.env.CLICKHOUSE_DB ?? "htap_analytics",
+  url: clickhouseUrl,
+  username: clickhouseUser,
+  password: clickhousePassword,
+  database: clickhouseDb,
 });
 
-function toClickHouseRow(row: SourceRow) {
-  return {
-    order_id: Number(row.order_id),
-    user_id: Number(row.user_id),
-    product_id: Number(row.product_id),
-    quantity: Number(row.quantity),
-    unit_price: row.unit_price,
-    total_amount: row.total_amount,
-    status: row.status,
-    category: row.category,
-    order_created_at: new Date(row.order_created_at)
-      .toISOString()
-      .slice(0, 19)
-      .replace("T", " "),
-  };
-}
+// ============================================================
+// Types
+// ============================================================
 
-async function queryClickHouse<T>(query: string): Promise<T[]> {
-  const result = await clickhouse.query({
-    query,
-    format: "JSONEachRow",
-  });
-  return result.json<T[]>();
-}
+type SourceRow = {
+  order_id: number;
+  user_id: number;
+  product_id: number;
+  quantity: number;
+  unit_price: string | number;
+  total_amount: string | number;
+  status: string;
+  category: string;
+  order_created_at: Date | string;
+};
 
-async function main() {
-  const startedAt = performance.now();
+// ============================================================
+// Main synchronization
+// ============================================================
 
-  const source = await pgPool.query<SourceRow>(`
-    SELECT
-      order_id,
-      user_id,
-      product_id,
-      quantity,
-      unit_price,
-      total_amount,
-      status,
-      category,
-      order_created_at
-    FROM order_analytics_source
-    ORDER BY order_id, product_id
-  `);
+async function sync(): Promise<void> {
+  const startedAt = Date.now();
 
-  console.log(`Source rows: ${source.rowCount ?? source.rows.length}`);
+  console.log("============================================================");
+  console.log("HTAP SNAPSHOT SYNCHRONIZATION");
+  console.log("PostgreSQL → ClickHouse");
+  console.log("============================================================");
 
-  await clickhouse.command({
-    query: "CREATE DATABASE IF NOT EXISTS htap_analytics",
-  });
+  try {
+    // ----------------------------------------------------------
+    // 1. Read PostgreSQL source data
+    // ----------------------------------------------------------
 
-  await clickhouse.command({
-    query: `
-      CREATE TABLE IF NOT EXISTS htap_analytics.fact_orders
-      (
-        order_id UInt64,
-        user_id UInt64,
-        product_id UInt64,
-        quantity UInt32,
-        unit_price Decimal(12, 2),
-        total_amount Decimal(14, 2),
-        status LowCardinality(String),
-        category LowCardinality(String),
-        order_created_at DateTime
-      )
-      ENGINE = MergeTree
-      PARTITION BY toYYYYMM(order_created_at)
-      ORDER BY (order_created_at, product_id, user_id)
-    `,
-  });
+    console.log("\n[1/5] Reading PostgreSQL source data...");
 
-  // Phase 1 is a full snapshot. Truncating first makes repeated development
-  // runs deterministic and prevents duplicate facts.
-  await clickhouse.command({
-    query: "TRUNCATE TABLE htap_analytics.fact_orders",
-  });
+    const sourceResult = await pool.query<SourceRow>(`
+      SELECT
+        oi.order_id,
+        o.user_id,
+        oi.product_id,
+        oi.quantity,
+        oi.unit_price,
+        ROUND(
+          (oi.quantity * oi.unit_price)::numeric,
+          2
+        ) AS total_amount,
+        o.status,
+        p.category,
+        o.created_at AS order_created_at
+      FROM order_items oi
+      JOIN orders o
+        ON o.id = oi.order_id
+      JOIN products p
+        ON p.id = oi.product_id
+      ORDER BY oi.order_id;
+    `);
 
-  const rows = source.rows.map(toClickHouseRow);
+    const rows = sourceResult.rows;
 
-  if (rows.length > 0) {
+    console.log(`PostgreSQL source rows: ${rows.length}`);
+
+    if (rows.length === 0) {
+      throw new Error("PostgreSQL returned zero source rows.");
+    }
+
+    // ----------------------------------------------------------
+    // 2. Clear ClickHouse destination
+    // ----------------------------------------------------------
+
+    console.log("\n[2/5] Preparing ClickHouse destination...");
+
+    await clickhouse.command({
+      query: `
+        TRUNCATE TABLE ${clickhouseDb}.fact_orders
+      `,
+    });
+
+    console.log("ClickHouse destination cleared.");
+
+    // ----------------------------------------------------------
+    // 3. Insert snapshot into ClickHouse
+    // ----------------------------------------------------------
+
+    console.log("\n[3/5] Synchronizing data to ClickHouse...");
+
+    const clickhouseRows = rows.map((row) => ({
+      order_id: Number(row.order_id),
+      user_id: Number(row.user_id),
+      product_id: Number(row.product_id),
+      quantity: Number(row.quantity),
+      unit_price: Number(row.unit_price),
+      total_amount: Number(row.total_amount),
+      status: row.status,
+      category: row.category,
+      order_created_at:
+        row.order_created_at instanceof Date
+          ? row.order_created_at.toISOString().slice(0, 19).replace("T", " ")
+          : String(row.order_created_at).replace("T", " ").slice(0, 19),
+    }));
+
     await clickhouse.insert({
-      table: "htap_analytics.fact_orders",
-      values: rows,
+      table: `${clickhouseDb}.fact_orders`,
+      values: clickhouseRows,
       format: "JSONEachRow",
     });
-  }
 
-  const destination = await queryClickHouse<{ count: string; total: string }>(`
-    SELECT
-      toString(count()) AS count,
-      toString(sum(total_amount)) AS total
-    FROM htap_analytics.fact_orders
-  `);
+    console.log("ClickHouse insert completed.");
 
-  const sourceCheck = await pgPool.query<{ count: string; total: string }>(`
-    SELECT
-      COUNT(*)::text AS count,
-      COALESCE(ROUND(SUM(total_amount), 2), 0)::text AS total
-    FROM order_analytics_source
-  `);
+    // ----------------------------------------------------------
+    // 4. Verify row count and revenue
+    // ----------------------------------------------------------
 
-  const sourceCount = sourceCheck.rows[0]?.count ?? "0";
-  const sourceTotal = sourceCheck.rows[0]?.total ?? "0";
-  const destinationCount = destination[0]?.count ?? "0";
-  const destinationTotal = destination[0]?.total ?? "0";
+    console.log("\n[4/5] Verifying synchronization...");
 
-  const consistent =
-    sourceCount === destinationCount &&
-    Number(sourceTotal).toFixed(2) === Number(destinationTotal).toFixed(2);
+    const pgCountResult = await pool.query<{ count: string }>(`
+      SELECT COUNT(*)::text AS count
+      FROM order_items;
+    `);
 
-  const elapsedMs = performance.now() - startedAt;
+    const pgRevenueResult = await pool.query<{ revenue: string }>(`
+      SELECT
+        ROUND(
+          SUM(quantity * unit_price)::numeric,
+          2
+        )::text AS revenue
+      FROM order_items;
+    `);
 
-  console.log(`Destination rows: ${destinationCount}`);
-  console.log(`Source revenue: ${Number(sourceTotal).toFixed(2)}`);
-  console.log(`Destination revenue: ${Number(destinationTotal).toFixed(2)}`);
-  console.log(`Consistency: ${consistent ? "PASS" : "FAIL"}`);
-  console.log(`Sync duration: ${elapsedMs.toFixed(2)} ms`);
+    const chCountResult = await clickhouse.query({
+      query: `
+        SELECT count() AS count
+        FROM ${clickhouseDb}.fact_orders
+      `,
+      format: "JSONEachRow",
+    });
 
-  if (!consistent) {
-    throw new Error("PostgreSQL and ClickHouse consistency check failed.");
+    const chRevenueResult = await clickhouse.query({
+      query: `
+        SELECT
+          round(
+            sum(toDecimal64(total_amount, 2)),
+            2
+          ) AS revenue
+        FROM ${clickhouseDb}.fact_orders
+      `,
+      format: "JSONEachRow",
+    });
+
+    const chCountRows = await chCountResult.json<{
+      count: string | number;
+    }>();
+
+    const chRevenueRows = await chRevenueResult.json<{
+      revenue: string | number;
+    }>();
+
+    const postgresRows = Number(pgCountResult.rows[0]?.count ?? 0);
+    const clickhouseRowsCount = Number(
+      chCountRows[0]?.count ?? 0,
+    );
+
+    const postgresRevenue = Number(
+      pgRevenueResult.rows[0]?.revenue ?? 0,
+    );
+
+    const clickhouseRevenue = Number(
+      chRevenueRows[0]?.revenue ?? 0,
+    );
+
+    const rowCountMatch =
+      postgresRows === clickhouseRowsCount;
+
+    const revenueMatch =
+      Math.abs(postgresRevenue - clickhouseRevenue) < 0.01;
+
+    console.log(`PostgreSQL rows : ${postgresRows}`);
+    console.log(`ClickHouse rows : ${clickhouseRowsCount}`);
+
+    console.log(
+      `PostgreSQL revenue : ${postgresRevenue.toFixed(2)}`,
+    );
+
+    console.log(
+      `ClickHouse revenue : ${clickhouseRevenue.toFixed(2)}`,
+    );
+
+    console.log(
+      `Row count match : ${rowCountMatch ? "PASS" : "FAIL"}`,
+    );
+
+    console.log(
+      `Revenue match   : ${revenueMatch ? "PASS" : "FAIL"}`,
+    );
+
+    if (!rowCountMatch || !revenueMatch) {
+      throw new Error(
+        "Synchronization verification failed.",
+      );
+    }
+
+    // ----------------------------------------------------------
+    // 5. Final result
+    // ----------------------------------------------------------
+
+    const duration = Date.now() - startedAt;
+
+    console.log("\n[5/5] Synchronization completed.");
+
+    console.log("\n============================================================");
+    console.log("SYNCHRONIZATION RESULT");
+    console.log("============================================================");
+    console.log(`Source rows       : ${postgresRows}`);
+    console.log(`Destination rows  : ${clickhouseRowsCount}`);
+    console.log(
+      `Revenue match     : ${revenueMatch ? "PASS" : "FAIL"}`,
+    );
+    console.log(
+      `Row count match   : ${rowCountMatch ? "PASS" : "FAIL"}`,
+    );
+    console.log(`Duration          : ${duration} ms`);
+    console.log("Status            : PASS");
+    console.log("============================================================");
+  } catch (error) {
+    console.error("\n============================================================");
+    console.error("SYNCHRONIZATION FAILED");
+    console.error("============================================================");
+
+    if (error instanceof Error) {
+      console.error(error.message);
+    } else {
+      console.error(error);
+    }
+
+    process.exitCode = 1;
+  } finally {
+    await pool.end();
+    await clickhouse.close();
   }
 }
 
-main()
-  .catch((error) => {
-    console.error("Synchronization failed:", error);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await pgPool.end();
-    await clickhouse.close();
-  });
+// ============================================================
+// Run
+// ============================================================
+
+sync();
